@@ -1,96 +1,127 @@
-import { useState, useEffect } from 'react';
-import { isPast, isToday, isTomorrow } from 'date-fns';
+import { useState, useEffect, useCallback } from 'react';
+import { 
+  analyzeShipmentForAlerts, 
+  processAlertNotifications,
+  deduplicateAlerts,
+  cleanupOutdatedAlerts
+} from '../services/alertService.js';
+import { alertStorage } from '../services/storageService.js';
 
 export const useAlerts = (shipments) => {
   const [alerts, setAlerts] = useState([]);
+  const [previousShipments, setPreviousShipments] = useState([]);
 
+  // Load saved alerts on initialization
   useEffect(() => {
+    const savedAlerts = alertStorage.load();
+    const cleanedAlerts = cleanupOutdatedAlerts(savedAlerts, shipments);
+    setAlerts(cleanedAlerts);
+    if (cleanedAlerts.length !== savedAlerts.length) {
+      alertStorage.save(cleanedAlerts);
+    }
+  }, []);
+
+  // Generate alerts based on shipment changes
+  useEffect(() => {
+    if (shipments.length === 0) return;
+
     const newAlerts = [];
 
     shipments.forEach(shipment => {
-      // Delay alerts
-      if (shipment.status === 'delayed') {
-        newAlerts.push({
-          id: `delay-${shipment.shipmentId}`,
-          type: 'warning',
-          message: `⚠️ Shipment "${shipment.nickname}" is experiencing delays. We'll keep monitoring.`,
-          shipmentId: shipment.shipmentId
-        });
-      }
-
-      // Exception alerts
-      if (shipment.status === 'exception') {
-        newAlerts.push({
-          id: `exception-${shipment.shipmentId}`,
-          type: 'error',
-          message: `🚨 Issue detected with "${shipment.nickname}". Check with carrier for details.`,
-          shipmentId: shipment.shipmentId
-        });
-      }
-
-      // Delivery alerts
-      if (shipment.status === 'delivered' && shipment.actualDelivery) {
-        const deliveredRecently = (new Date() - shipment.actualDelivery) < 60000; // Last minute
-        if (deliveredRecently) {
-          newAlerts.push({
-            id: `delivered-${shipment.shipmentId}`,
-            type: 'success',
-            message: `✅ Great news! "${shipment.nickname}" has been delivered.`,
-            shipmentId: shipment.shipmentId
-          });
-        }
-      }
-
-      // Late delivery alerts
-      if (
-        shipment.estimatedDelivery &&
-        isPast(shipment.estimatedDelivery) &&
-        shipment.status !== 'delivered' &&
-        shipment.status !== 'delayed'
-      ) {
-        newAlerts.push({
-          id: `late-${shipment.shipmentId}`,
-          type: 'warning',
-          message: `📅 "${shipment.nickname}" was expected yesterday but hasn't been delivered yet.`,
-          shipmentId: shipment.shipmentId
-        });
-      }
-
-      // Delivery today alerts
-      if (
-        shipment.estimatedDelivery &&
-        isToday(shipment.estimatedDelivery) &&
-        shipment.status === 'out_for_delivery'
-      ) {
-        newAlerts.push({
-          id: `today-${shipment.shipmentId}`,
-          type: 'info',
-          message: `📦 "${shipment.nickname}" is out for delivery and should arrive today!`,
-          shipmentId: shipment.shipmentId
-        });
-      }
-
-      // Delivery tomorrow alerts
-      if (
-        shipment.estimatedDelivery &&
-        isTomorrow(shipment.estimatedDelivery) &&
-        shipment.status === 'in_transit'
-      ) {
-        newAlerts.push({
-          id: `tomorrow-${shipment.shipmentId}`,
-          type: 'info',
-          message: `🚛 "${shipment.nickname}" should arrive tomorrow. We'll notify you of any changes.`,
-          shipmentId: shipment.shipmentId
-        });
-      }
+      // Find previous version of this shipment
+      const previousShipment = previousShipments.find(
+        prev => prev.shipmentId === shipment.shipmentId
+      );
+      
+      const previousStatus = previousShipment?.status;
+      
+      // Analyze shipment for potential alerts
+      const shipmentAlerts = analyzeShipmentForAlerts(shipment, previousStatus);
+      newAlerts.push(...shipmentAlerts);
     });
 
-    setAlerts(newAlerts);
-  }, [shipments]);
+    if (newAlerts.length > 0) {
+      setAlerts(prevAlerts => {
+        // Deduplicate alerts to avoid spam
+        const uniqueNewAlerts = deduplicateAlerts(newAlerts, prevAlerts);
+        
+        if (uniqueNewAlerts.length === 0) return prevAlerts;
+        
+        const updatedAlerts = [...uniqueNewAlerts, ...prevAlerts];
+        
+        // Clean up outdated alerts
+        const cleanedAlerts = cleanupOutdatedAlerts(updatedAlerts, shipments);
+        
+        // Persist to storage
+        alertStorage.save(cleanedAlerts);
+        
+        // Send email notifications for new alerts (async, non-blocking)
+        if (uniqueNewAlerts.length > 0) {
+          processAlertNotifications(uniqueNewAlerts, 'user@example.com')
+            .catch(error => console.error('Failed to send alert notifications:', error));
+        }
+        
+        return cleanedAlerts;
+      });
+    }
 
-  const dismissAlert = (alertId) => {
-    setAlerts(prev => prev.filter(alert => alert.id !== alertId));
+    // Update previous shipments for next comparison
+    setPreviousShipments(shipments);
+  }, [shipments, previousShipments]);
+
+  const dismissAlert = useCallback((alertId) => {
+    setAlerts(prevAlerts => {
+      const updatedAlerts = prevAlerts.map(alert =>
+        alert.id === alertId
+          ? { ...alert, dismissed: true, dismissedAt: new Date().toISOString() }
+          : alert
+      );
+      
+      alertStorage.save(updatedAlerts);
+      return updatedAlerts.filter(alert => !alert.dismissed);
+    });
+  }, []);
+
+  const clearAllAlerts = useCallback(() => {
+    setAlerts([]);
+    alertStorage.save([]);
+  }, []);
+
+  const markAlertAsRead = useCallback((alertId) => {
+    setAlerts(prevAlerts => {
+      const updatedAlerts = prevAlerts.map(alert =>
+        alert.id === alertId
+          ? { ...alert, read: true, readAt: new Date().toISOString() }
+          : alert
+      );
+      
+      alertStorage.save(updatedAlerts);
+      return updatedAlerts;
+    });
+  }, []);
+
+  // Get alert counts by type/priority
+  const getAlertCounts = useCallback(() => {
+    return {
+      total: alerts.length,
+      unread: alerts.filter(alert => !alert.read).length,
+      high: alerts.filter(alert => alert.priority === 'high').length,
+      medium: alerts.filter(alert => alert.priority === 'medium').length,
+      low: alerts.filter(alert => alert.priority === 'low').length,
+      byType: {
+        warning: alerts.filter(alert => alert.type === 'warning').length,
+        error: alerts.filter(alert => alert.type === 'error').length,
+        info: alerts.filter(alert => alert.type === 'info').length,
+        success: alerts.filter(alert => alert.type === 'success').length
+      }
+    };
+  }, [alerts]);
+
+  return {
+    alerts: alerts.filter(alert => !alert.dismissed),
+    dismissAlert,
+    clearAllAlerts,
+    markAlertAsRead,
+    getAlertCounts
   };
-
-  return { alerts, dismissAlert };
 };
