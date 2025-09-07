@@ -1,5 +1,8 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { addHours, addDays, subHours } from 'date-fns';
+import { fetchTrackingData, detectCarrier } from '../services/api.js';
+import { canAddShipment } from '../services/subscriptionService.js';
+import { shipmentStorage, initializeStorage } from '../services/storageService.js';
 
 // Sample shipment data generator
 const generateShipmentId = () => {
@@ -85,17 +88,49 @@ const initialShipments = [
 ];
 
 export const useShipmentStore = () => {
-  const [shipments, setShipments] = useState(initialShipments);
+  const [shipments, setShipments] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [isInitialized, setIsInitialized] = useState(false);
+
+  // Initialize storage and load saved shipments
+  useEffect(() => {
+    const initialize = async () => {
+      try {
+        const storageAvailable = initializeStorage();
+        if (storageAvailable) {
+          const savedShipments = shipmentStorage.load();
+          if (savedShipments.length > 0) {
+            setShipments(savedShipments);
+          } else {
+            // Load initial sample data if no saved shipments
+            setShipments(initialShipments);
+            shipmentStorage.save(initialShipments);
+          }
+        } else {
+          // Fallback to initial data if storage not available
+          setShipments(initialShipments);
+        }
+      } catch (error) {
+        console.error('Failed to initialize shipment store:', error);
+        setShipments(initialShipments);
+      } finally {
+        setIsInitialized(true);
+      }
+    };
+
+    initialize();
+  }, []);
 
   const addShipment = useCallback(async (trackingData) => {
     setIsLoading(true);
     setError(null);
     
     try {
-      // Simulate API call delay
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Check subscription limits
+      if (!canAddShipment(shipments.length)) {
+        throw new Error('Shipment limit reached for your current plan');
+      }
       
       // Check for duplicate tracking numbers
       const existingShipment = shipments.find(s => s.trackingNumber === trackingData.trackingNumber);
@@ -103,8 +138,32 @@ export const useShipmentStore = () => {
         throw new Error('This tracking number is already being tracked');
       }
       
-      const newShipment = generateTrackingData(trackingData);
-      setShipments(prev => [newShipment, ...prev]);
+      // Auto-detect carrier if not provided
+      const carrier = trackingData.carrier || detectCarrier(trackingData.trackingNumber);
+      
+      // Fetch real tracking data from API
+      let shipmentData;
+      try {
+        shipmentData = await fetchTrackingData(trackingData.trackingNumber, carrier);
+      } catch (apiError) {
+        console.warn('API fetch failed, using mock data:', apiError);
+        // Fallback to mock data if API fails
+        shipmentData = generateTrackingData({ ...trackingData, carrier });
+      }
+      
+      // Create complete shipment object
+      const newShipment = {
+        ...shipmentData,
+        shipmentId: generateShipmentId(),
+        nickname: trackingData.nickname || `${carrier.toUpperCase()} Package`,
+        addedAt: new Date().toISOString()
+      };
+      
+      // Update state and persist to storage
+      const updatedShipments = [newShipment, ...shipments];
+      setShipments(updatedShipments);
+      shipmentStorage.save(updatedShipments);
+      
     } catch (err) {
       setError(err.message);
     } finally {
@@ -113,45 +172,135 @@ export const useShipmentStore = () => {
   }, [shipments]);
 
   const updateShipmentStatus = useCallback((shipmentId) => {
-    setShipments(prev => prev.map(shipment => {
-      if (shipment.shipmentId !== shipmentId) return shipment;
+    setShipments(prev => {
+      const updatedShipments = prev.map(shipment => {
+        if (shipment.shipmentId !== shipmentId) return shipment;
+        
+        const statuses = ['pending', 'in_transit', 'out_for_delivery', 'delivered'];
+        const currentIndex = statuses.indexOf(shipment.status);
+        
+        // Don't update if already delivered or if status progression doesn't make sense
+        if (shipment.status === 'delivered' || shipment.status === 'delayed') return shipment;
+        
+        const nextIndex = Math.min(currentIndex + 1, statuses.length - 1);
+        const newStatus = statuses[nextIndex];
+        
+        const now = new Date();
+        const newHistoricalStatus = {
+          status: newStatus,
+          timestamp: now,
+          location: `Updated location ${nextIndex + 1}`,
+          description: generateStatusDescription(newStatus)
+        };
+        
+        const updatedShipment = {
+          ...shipment,
+          status: newStatus,
+          lastUpdated: now,
+          actualDelivery: newStatus === 'delivered' ? now : shipment.actualDelivery,
+          historicalStatuses: [...shipment.historicalStatuses, newHistoricalStatus]
+        };
+        
+        return updatedShipment;
+      });
       
-      const statuses = ['pending', 'in_transit', 'out_for_delivery', 'delivered'];
-      const currentIndex = statuses.indexOf(shipment.status);
-      
-      // Don't update if already delivered or if status progression doesn't make sense
-      if (shipment.status === 'delivered' || shipment.status === 'delayed') return shipment;
-      
-      const nextIndex = Math.min(currentIndex + 1, statuses.length - 1);
-      const newStatus = statuses[nextIndex];
-      
-      const now = new Date();
-      const newHistoricalStatus = {
-        status: newStatus,
-        timestamp: now,
-        location: `Updated location ${nextIndex + 1}`
-      };
-      
-      return {
-        ...shipment,
-        status: newStatus,
-        lastUpdated: now,
-        actualDelivery: newStatus === 'delivered' ? now : shipment.actualDelivery,
-        historicalStatuses: [...shipment.historicalStatuses, newHistoricalStatus]
-      };
-    }));
+      // Persist to storage
+      shipmentStorage.save(updatedShipments);
+      return updatedShipments;
+    });
   }, []);
 
   const deleteShipment = useCallback((shipmentId) => {
-    setShipments(prev => prev.filter(shipment => shipment.shipmentId !== shipmentId));
+    setShipments(prev => {
+      const filteredShipments = prev.filter(shipment => shipment.shipmentId !== shipmentId);
+      shipmentStorage.save(filteredShipments);
+      return filteredShipments;
+    });
   }, []);
+
+  // Refresh shipment data from API
+  const refreshShipment = useCallback(async (shipmentId) => {
+    setIsLoading(true);
+    setError(null);
+    
+    try {
+      const shipment = shipments.find(s => s.shipmentId === shipmentId);
+      if (!shipment) {
+        throw new Error('Shipment not found');
+      }
+      
+      const updatedData = await fetchTrackingData(shipment.trackingNumber, shipment.carrier);
+      
+      setShipments(prev => {
+        const updatedShipments = prev.map(s =>
+          s.shipmentId === shipmentId
+            ? { ...s, ...updatedData, lastUpdated: new Date().toISOString() }
+            : s
+        );
+        shipmentStorage.save(updatedShipments);
+        return updatedShipments;
+      });
+      
+    } catch (err) {
+      setError(`Failed to refresh shipment: ${err.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [shipments]);
+
+  // Bulk refresh all active shipments
+  const refreshAllShipments = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+    
+    try {
+      const activeShipments = shipments.filter(s => s.status !== 'delivered');
+      const refreshPromises = activeShipments.map(async (shipment) => {
+        try {
+          const updatedData = await fetchTrackingData(shipment.trackingNumber, shipment.carrier);
+          return { ...shipment, ...updatedData, lastUpdated: new Date().toISOString() };
+        } catch (error) {
+          console.warn(`Failed to refresh ${shipment.trackingNumber}:`, error);
+          return shipment; // Return original if refresh fails
+        }
+      });
+      
+      const refreshedShipments = await Promise.all(refreshPromises);
+      const deliveredShipments = shipments.filter(s => s.status === 'delivered');
+      
+      const allShipments = [...refreshedShipments, ...deliveredShipments];
+      setShipments(allShipments);
+      shipmentStorage.save(allShipments);
+      
+    } catch (err) {
+      setError(`Failed to refresh shipments: ${err.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [shipments]);
+
+  // Add helper function for status descriptions
+  const generateStatusDescription = (status) => {
+    const descriptions = {
+      pending: 'Package information received',
+      in_transit: 'Package is in transit to destination',
+      out_for_delivery: 'Package is out for delivery',
+      delivered: 'Package has been delivered',
+      delayed: 'Package delivery delayed'
+    };
+    
+    return descriptions[status] || 'Status update';
+  };
 
   return {
     shipments,
     addShipment,
     updateShipmentStatus,
     deleteShipment,
+    refreshShipment,
+    refreshAllShipments,
     isLoading,
-    error
+    error,
+    isInitialized
   };
 };

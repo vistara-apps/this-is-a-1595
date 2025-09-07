@@ -4,8 +4,11 @@ import TrackingInput from './components/TrackingInput';
 import ShipmentCard from './components/ShipmentCard';
 import AlertNotification from './components/AlertNotification';
 import SubscriptionModal from './components/SubscriptionModal';
+import SettingsModal from './components/SettingsModal';
+import ErrorBoundary from './components/ErrorBoundary';
 import { useShipmentStore } from './hooks/useShipmentStore';
 import { useAlerts } from './hooks/useAlerts';
+import { canAddShipment, getUsageStats } from './services/subscriptionService.js';
 
 function App() {
   const {
@@ -13,17 +16,30 @@ function App() {
     addShipment,
     updateShipmentStatus,
     deleteShipment,
+    refreshShipment,
+    refreshAllShipments,
     isLoading,
-    error
+    error,
+    isInitialized
   } = useShipmentStore();
   
-  const { alerts, dismissAlert } = useAlerts(shipments);
+  const { alerts, dismissAlert, clearAllAlerts, getAlertCounts } = useAlerts(shipments);
   const [showSubscriptionModal, setShowSubscriptionModal] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [filter, setFilter] = useState('all');
   const [searchTerm, setSearchTerm] = useState('');
+  const [usageStats, setUsageStats] = useState(null);
+
+  // Load usage stats
+  useEffect(() => {
+    const stats = getUsageStats();
+    setUsageStats(stats);
+  }, [shipments]);
 
   // Simulate real-time updates
   useEffect(() => {
+    if (!isInitialized) return;
+    
     const interval = setInterval(() => {
       shipments.forEach(shipment => {
         if (shipment.status !== 'delivered' && Math.random() < 0.1) {
@@ -33,7 +49,7 @@ function App() {
     }, 30000); // Check every 30 seconds
 
     return () => clearInterval(interval);
-  }, [shipments, updateShipmentStatus]);
+  }, [shipments, updateShipmentStatus, isInitialized]);
 
   const filteredShipments = shipments.filter(shipment => {
     const matchesSearch = shipment.nickname.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -48,7 +64,7 @@ function App() {
   });
 
   const handleAddShipment = (trackingData) => {
-    if (shipments.length >= 3 && !showSubscriptionModal) {
+    if (!canAddShipment(shipments.length)) {
       setShowSubscriptionModal(true);
       return;
     }
@@ -61,6 +77,8 @@ function App() {
         onSearch={setSearchTerm}
         searchTerm={searchTerm}
         onUpgrade={() => setShowSubscriptionModal(true)}
+        onSettings={() => setShowSettingsModal(true)}
+        alertCount={getAlertCounts().total}
       />
       
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -152,8 +170,22 @@ function App() {
           currentShipments={shipments.length}
         />
       )}
+
+      {/* Settings Modal */}
+      {showSettingsModal && (
+        <SettingsModal
+          onClose={() => setShowSettingsModal(false)}
+        />
+      )}
     </div>
   );
 }
 
-export default App;
+// Wrap App with ErrorBoundary
+const AppWithErrorBoundary = () => (
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>
+);
+
+export default AppWithErrorBoundary;
